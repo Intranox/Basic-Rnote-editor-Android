@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.NoteAdd
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Print
+import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.SaveAs
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.TouchApp
@@ -99,6 +100,10 @@ fun RnoteTopBar(
     onShare: (ShareTarget) -> Unit = {},
     /** The notes opened or saved last. */
     onShowRecent: () -> Unit = {},
+    /** Whether the note has a file of its own, whose earlier versions could have been kept. */
+    canRestoreVersion: Boolean = false,
+    /** The versions kept of the note's file before it was saved over, to bring one back. */
+    onRestoreVersion: () -> Unit = {},
     /** Thumbnails of every page, to jump to one. */
     onShowPages: () -> Unit = {},
     /** The note to Android's print dialog. */
@@ -117,10 +122,11 @@ fun RnoteTopBar(
     onTogglePenSounds: () -> Unit = {},
     blockPinchZoom: Boolean = false,
     onToggleBlockPinchZoom: () -> Unit = {},
-    /** Rnote's canvas menu zoom row: out, in, and to the page's width. */
+    /** Rnote's canvas menu zoom row: out, in, to the page's width and to its real size. */
     onZoomOut: () -> Unit = {},
     onZoomIn: () -> Unit = {},
     onZoomFitWidth: () -> Unit = {},
+    onZoomRealSize: () -> Unit = {},
     /** Rnote's page buttons, which only a Fixed Size document has a use for. */
     isFixedSize: Boolean = false,
     canRemovePage: Boolean = false,
@@ -284,6 +290,9 @@ fun RnoteTopBar(
                         IconButton(onClick = { showCanvasMenu = false; onZoomFitWidth() }) {
                             Icon(GeneratedIcons.ZoomFitWidth, "Zoom to Page Width")
                         }
+                        IconButton(onClick = { showCanvasMenu = false; onZoomRealSize() }) {
+                            Icon(GeneratedIcons.ZoomRealSize, "Zoom to Real Size")
+                        }
                     }
                     HorizontalDivider()
                     // Always listed, as in Rnote, and only usable in the layout they are for.
@@ -379,6 +388,12 @@ fun RnoteTopBar(
                         text = { Text("Save As…") },
                         trailingIcon = { KeyHint("Ctrl+Shift+S") },
                         onClick = { showOverflowMenu = false; onSaveDocumentAs() }
+                    )
+                    DropdownMenuItem(
+                        leadingIcon = { Icon(Icons.Default.Restore, null) },
+                        text = { Text("Restore Previous Version…") },
+                        enabled = canRestoreVersion,
+                        onClick = { showOverflowMenu = false; onRestoreVersion() }
                     )
                     DropdownMenuItem(
                         leadingIcon = { Icon(Icons.Default.PictureAsPdf, null) },

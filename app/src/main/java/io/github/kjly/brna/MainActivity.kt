@@ -12,6 +12,7 @@ import android.print.PrintManager
 import android.provider.DocumentsContract
 import android.view.InputDevice
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -41,9 +42,14 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
@@ -54,6 +60,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
@@ -113,12 +120,15 @@ import io.github.kjly.brna.model.TextFormatting
 import io.github.kjly.brna.model.TextToggle
 import io.github.kjly.brna.model.ToolConfig
 import io.github.kjly.brna.model.ToolType
+import io.github.kjly.brna.model.PenMode
+import io.github.kjly.brna.model.PenModes
 import io.github.kjly.brna.model.PenShortcutState
 import io.github.kjly.brna.model.ShortcutKey
 import io.github.kjly.brna.model.UndoHistory
 import io.github.kjly.brna.model.ViewportState
 import io.github.kjly.brna.model.SnapPositions
 import io.github.kjly.brna.render.NativeElementRenderer
+import io.github.kjly.brna.storage.Backups
 import io.github.kjly.brna.storage.ContentHash
 import io.github.kjly.brna.storage.CustomFonts
 import io.github.kjly.brna.storage.DocumentUri
@@ -148,6 +158,7 @@ import io.github.kjly.brna.ui.KeyboardShortcuts
 import io.github.kjly.brna.ui.PenRemote
 import io.github.kjly.brna.ui.Shortcut
 import io.github.kjly.brna.ui.canvas.SelectionManager
+import io.github.kjly.brna.ui.canvas.StylusButtons
 import io.github.kjly.brna.ui.components.ColorPicker
 import io.github.kjly.brna.ui.components.ExportSheet
 import io.github.kjly.brna.ui.components.FontManagerDialog
@@ -158,15 +169,18 @@ import io.github.kjly.brna.storage.PdfPageLayout
 import io.github.kjly.brna.ui.components.PdfImportDialog
 import io.github.kjly.brna.ui.components.PenConfigStrip
 import io.github.kjly.brna.ui.components.PenPicker
+import io.github.kjly.brna.ui.components.ProtectedNoteBanner
 import io.github.kjly.brna.ui.components.RnoteTopBar
 import io.github.kjly.brna.ui.components.PageOverviewDialog
 import io.github.kjly.brna.ui.components.RecentFilesDialog
+import io.github.kjly.brna.ui.components.RestoreVersionDialog
 import io.github.kjly.brna.ui.components.InlineTextEditor
 import io.github.kjly.brna.ui.components.NoteTab
 import io.github.kjly.brna.ui.components.NoteTabBar
 import io.github.kjly.brna.ui.components.TextBoxStyle
 import io.github.kjly.brna.ui.components.WorkspaceBrowser
 import io.github.kjly.brna.ui.theme.BabyRnoteTheme
+import io.github.kjly.brna.ui.theme.BrnaColors
 
 /**
  * One undo step: the ink and the desktop elements together, so undoing a Clear Canvas
@@ -191,7 +205,8 @@ private data class ParkedTab(
     val uri: Uri?,
     val knownLastModified: Long?,
     val saveAsRnote: Boolean,
-    val knownContentHash: String? = null
+    val knownContentHash: String? = null,
+    val protectedFrom: String? = null
 )
 
 /** Copied ink and desktop elements. */
@@ -317,11 +332,22 @@ class MainActivity : ComponentActivity() {
     /** Notes recovered from the last session, one per tab they were in, waiting to be offered back. */
     private var pendingRecovery by mutableStateOf<List<Recovery.Pending>>(emptyList())
 
-    /** Set when [incomingDocument] is the open note reloaded from its file. */
+    /** Set when [incomingDocument] is the open note reloaded from its file, or an earlier version of it restored. */
     private var incomingKeepsView = false
 
-    /** Set when [incomingDocument] is a Xournal++ file made into a note: new, and not yet saved anywhere. */
+    /**
+     * Set when [incomingDocument] is unsaved: a Xournal++ file made into a note, not yet saved
+     * anywhere, or an earlier version of the note restored, not yet back in its file.
+     */
     private var incomingUnsaved = false
+
+    /**
+     * The Rnote version the open note's file came from, when that is newer than this app
+     * knows the format of (see [RnoteVersion]); null otherwise. Such a file is shown but
+     * never written back over — the note has no file of its own, as an imported one hasn't,
+     * so autosave keeps only the recovery copy and Save asks where to put a copy.
+     */
+    private var protectedFrom by mutableStateOf<String?>(null)
 
     // ── Tabs ──────────────────────────────────────────────────────────────────
 
@@ -553,6 +579,8 @@ class MainActivity : ComponentActivity() {
 
     /** Installed by the UI: Rnote's Ctrl+Space button shortcut went down (true) or came up. */
     private var penShortcutKeyHandler: ((ShortcutKey, Boolean) -> Unit)? = null
+    /** The end of the stylus in a pointer event, whichever view it goes to (see PenModes). */
+    private var penModeHandler: ((PenMode) -> Unit)? = null
     private var ctrlSpaceDown = false
 
     /** Renders the PDF's pages off the main thread and adds them to the open note. */
@@ -820,6 +848,15 @@ class MainActivity : ComponentActivity() {
                     knownLastModified = null
                     knownContentHash = null
                     incomingUnsaved = true
+                } else if (loaded.newerRnote != null) {
+                    // From an Rnote newer than this app knows the format of: shown, and kept
+                    // among the recent notes, but never saved over — see protectedFrom.
+                    DocumentUri.takePersistablePermission(this@MainActivity, uri)
+                    RecentFiles.add(this@MainActivity, uri, title)
+                    currentDocumentUri = null
+                    pickerStartUri = uri
+                    knownLastModified = null
+                    knownContentHash = null
                 } else {
                     adoptDocumentUri(uri, title)
                     // Set here on the main thread together with incomingDocument, never earlier:
@@ -828,6 +865,7 @@ class MainActivity : ComponentActivity() {
                     knownLastModified = lastModified
                     knownContentHash = loaded.contentHash
                 }
+                protectedFrom = loaded.newerRnote
                 incomingKeepsView = reload
                 incomingDocument = loaded.document.copy(title = title)
                 Toast.makeText(
@@ -836,6 +874,7 @@ class MainActivity : ComponentActivity() {
                         automatic -> "Newer version of $title loaded"
                         reload -> "Loaded their version of $title"
                         loaded.imported -> "Imported: $title — Save keeps it as an .rnote"
+                        loaded.newerRnote != null -> "Opened: $title — from Rnote ${loaded.newerRnote}, it won't be saved over"
                         else -> "Opened: $title"
                     },
                     Toast.LENGTH_SHORT
@@ -881,6 +920,60 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * "Restore Previous Version": [version], a copy [Backups] kept of the open note's file,
+     * in place of what the tab shows, the view left where it was. Unsaved, as Rnote leaves
+     * a note it opened into: it goes back into the file with the next save, and until then
+     * the file is as it was. The note is saved first, and what the file holds then is kept
+     * too, so the version it held before the restore can be brought back the same way.
+     */
+    private fun restoreVersion(version: Backups.Version) {
+        val uri = currentDocumentUri ?: return
+        if (busyMessage != null) return
+        val slot = activeTab
+        lifecycleScope.launch {
+            if (!autosaveNow()) {
+                Toast.makeText(
+                    this@MainActivity,
+                    "Save the note first — its changes couldn't be written to its file",
+                    Toast.LENGTH_LONG
+                ).show()
+                return@launch
+            }
+            if (busyMessage != null || uri != currentDocumentUri || slot != activeTab) return@launch
+            busyMessage = "Restoring…"
+            val result = withContext(Dispatchers.IO) {
+                writeLock.withLock { Backups.keepNow(this@MainActivity, uri) }
+                try {
+                    FileManager.loadDocumentFromUri(this@MainActivity, Uri.fromFile(version.file))
+                        ?.let { it to DocumentUri.displayName(this@MainActivity, uri) }
+                } catch (e: Throwable) {
+                    e.printStackTrace()
+                    null
+                }
+            }
+            busyMessage = null
+            val (loaded, fileName) = result ?: (null to null)
+            // Only what this app wrote over, so never an import or a file from a newer Rnote.
+            if (loaded == null || loaded.imported || loaded.newerRnote != null) {
+                Toast.makeText(this@MainActivity, "Could not restore that version", Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            // Another note put on screen meanwhile: this one is not for it.
+            if (uri != currentDocumentUri || slot != activeTab) return@launch
+            val title = fileName?.let(DocumentUri::titleFrom) ?: loaded.document.title
+            saveAsRnote = loaded.isNativeRnote
+            incomingKeepsView = true
+            incomingUnsaved = true
+            incomingDocument = loaded.document.copy(title = title)
+            Toast.makeText(
+                this@MainActivity,
+                "Earlier version restored — the next save puts it back in the file",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
     /** Writes back over the file the note came from. False when it has no file yet. */
     private fun saveInPlace(document: NoteDocument, overwriteChanges: Boolean = false): Boolean {
         val target = currentDocumentUri ?: return false
@@ -898,7 +991,11 @@ class MainActivity : ComponentActivity() {
                     pendingConflict = document
                     return@launch
                 }
-                val written = writeLock.withLock { withContext(Dispatchers.IO) { writeDocument(target, document, asRnote) } }
+                val written = writeLock.withLock {
+                    withContext(Dispatchers.IO) {
+                        writeDocument(target, document, asRnote, knownHash, changedSince = overwriteChanges || known == null)
+                    }
+                }
                 busyMessage = null
                 if (written != null) {
                     afterSave(target, document, slot, written)
@@ -1118,7 +1215,7 @@ class MainActivity : ComponentActivity() {
                     e.printStackTrace()
                 }
                 if (target != null && busyMessage == null && !changedElsewhere(target, known, knownHash)) {
-                    writeLock.withLock { writeDocument(target, document, asRnote) }
+                    writeLock.withLock { writeDocument(target, document, asRnote, knownHash, changedSince = known == null) }
                 } else {
                     null
                 }
@@ -1136,9 +1233,21 @@ class MainActivity : ComponentActivity() {
     /**
      * Blocking write; call from [Dispatchers.IO]. The [ContentHash] of what was written, or
      * null on any failure, OOM included.
+     *
+     * What the file held is kept first, unless it is what this app wrote there last (see
+     * [Backups.beforeOverwrite]): [knownHash] is the fingerprint of what it held when last
+     * read or written here, and [changedSince] says it may hold something else by now —
+     * written elsewhere and about to be overwritten anyway, or with no time to tell.
      */
-    private fun writeDocument(uri: Uri, document: NoteDocument, asRnote: Boolean): String? = try {
-        FileManager.saveDocumentHashed(this, uri, document, asRnote)
+    private fun writeDocument(
+        uri: Uri,
+        document: NoteDocument,
+        asRnote: Boolean,
+        knownHash: String? = null,
+        changedSince: Boolean = true
+    ): String? = try {
+        Backups.beforeOverwrite(this, uri, knownHash, changedSince)
+        FileManager.saveDocumentHashed(this, uri, document, asRnote)?.also { Backups.written(this, uri, it) }
     } catch (e: Throwable) {
         e.printStackTrace()
         null
@@ -1147,7 +1256,8 @@ class MainActivity : ComponentActivity() {
     /** Asks for a destination, then saves there and adopts it. */
     private fun launchSavePicker(document: NoteDocument) {
         pendingDocumentToSave = document
-        val safeTitle = document.title.ifBlank { "MyNote" }
+        // A note from a newer Rnote goes beside its file under a name of its own, not over it.
+        val safeTitle = document.title.ifBlank { "MyNote" }.let { if (protectedFrom != null) "$it (copy)" else it }
         if (saveAsRnote) {
             createRnoteLauncher.launch("$safeTitle.rnote")
         } else {
@@ -1174,6 +1284,8 @@ class MainActivity : ComponentActivity() {
                 // saved under — otherwise the title in the bar and the file on disk disagree.
                 val savedTitle = DocumentUri.displayName(this@MainActivity, uri)?.let(DocumentUri::titleFrom)
                 adoptDocumentUri(uri, savedTitle ?: document.title)
+                // A copy of a note from a newer Rnote is this app's own file, written as it writes one.
+                protectedFrom = null
                 savedTitle?.let { onTitleAdopted?.invoke(it) }
                 afterSave(uri, document, slot, written)
                 Toast.makeText(
@@ -1423,9 +1535,13 @@ class MainActivity : ComponentActivity() {
             var paperStyle by remember {
                 mutableStateOf(SettingsManager.loadPaperStyle(this))
             }
+            // Rnote's "Stylus pen modes": the pen each end of the stylus has, and whether it is
+            // locked (see PenModes); the app starts with the tip's, as Rnote does.
+            var penModes by remember { mutableStateOf(SettingsManager.loadPenModes(this)) }
             var toolConfig by remember {
                 mutableStateOf(
                     ToolConfig(
+                        activeTool = penModes.penTool,
                         allowFingerDrawing = SettingsManager.loadAllowFingerDrawing(this),
                         snapPositions = SettingsManager.loadSnapPositions(this),
                         blockPinchZoom = SettingsManager.loadBlockPinchZoom(this),
@@ -1477,6 +1593,14 @@ class MainActivity : ComponentActivity() {
             // pressing one has done to the pen (see PenShortcutState).
             var penShortcuts by remember { mutableStateOf(SettingsManager.loadPenShortcuts(this)) }
             val penShortcutState = remember { PenShortcutState() }
+            // Which end of the stylus is in use; only a stylus changes it, as in Rnote.
+            var penMode by remember { mutableStateOf(PenMode.PEN) }
+            val setPenModes: (PenModes) -> Unit = { modes ->
+                if (modes != penModes) {
+                    penModes = modes
+                    SettingsManager.savePenModes(this@MainActivity, modes)
+                }
+            }
             // Rnote's Focus Mode: the pen picker, the colour picker and the pen settings put
             // away, leaving the page and the headerbar. Neither is kept once the app closes,
             // in Rnote as here.
@@ -1537,6 +1661,7 @@ class MainActivity : ComponentActivity() {
             var canvasTop by remember { mutableFloatStateOf(0f) }
             var textSessionCount by remember { mutableIntStateOf(0) }
             var showRecent by remember { mutableStateOf(false) }
+            var showRestore by remember { mutableStateOf(false) }
             var showFiles by remember { mutableStateOf(false) }
             var showPages by remember { mutableStateOf(false) }
             val snapshot = { DocSnapshot(strokes.toList(), documentNativeElements) }
@@ -1656,7 +1781,8 @@ class MainActivity : ComponentActivity() {
                     onDocumentLoaded(pendingDocument)
                     incomingDocument = null
                     if (incomingUnsaved) {
-                        // Imported, not yet anywhere: unsaved, as Rnote marks it.
+                        // Imported, not yet anywhere, or restored, not yet in the file:
+                        // unsaved, as Rnote marks it.
                         incomingUnsaved = false
                         isModified = true
                     }
@@ -1693,6 +1819,7 @@ class MainActivity : ComponentActivity() {
                 currentDocumentUri = null
                 knownLastModified = null
                 knownContentHash = null
+                protectedFrom = null
             }
 
             // ── Tabs ──────────────────────────────────────────────────────────────
@@ -1711,7 +1838,8 @@ class MainActivity : ComponentActivity() {
                     uri = currentDocumentUri,
                     knownLastModified = knownLastModified,
                     saveAsRnote = saveAsRnote,
-                    knownContentHash = knownContentHash
+                    knownContentHash = knownContentHash,
+                    protectedFrom = protectedFrom
                 )
             }
             val showParked: (ParkedTab) -> Unit = { tab ->
@@ -1733,6 +1861,7 @@ class MainActivity : ComponentActivity() {
                 knownLastModified = tab.knownLastModified
                 knownContentHash = tab.knownContentHash
                 saveAsRnote = tab.saveAsRnote
+                protectedFrom = tab.protectedFrom
                 isModified = tab.isModified
             }
             // An untouched new note: what a note being opened may take the place of.
@@ -2152,7 +2281,11 @@ class MainActivity : ComponentActivity() {
                     onTextChange(TextFieldValue(typed, TextRange(v.selection.min + text.length)))
                     return@take
                 }
-                val corner = at ?: (viewportState.screenToCanvas(Offset.Zero) + Offset(IMPORT_OFFSET, IMPORT_OFFSET))
+                // Rnote's `determine_stroke_import_pos`: where it was dropped, or into the view
+                // but not before the document's origin, which only an infinite one goes past.
+                val corner = at ?: (viewportState.screenToCanvas(Offset.Zero) + Offset(IMPORT_OFFSET, IMPORT_OFFSET)).let {
+                    if (paperStyle.layoutMode == LayoutMode.INFINITE) it else Offset(maxOf(it.x, 0f), maxOf(it.y, 0f))
+                }
                 val c = toolConfig.penColor
                 val box = NativeEditing.createText(
                     text, corner.x, corner.y, toolConfig.textSize,
@@ -2340,6 +2473,46 @@ class MainActivity : ComponentActivity() {
                 penShortcutState.picked()
                 switchTool(newTool)
             }
+            // The end of the stylus in use keeps the pen it has — not a button's temporary
+            // one — however it was picked, as each of Rnote's pen modes keeps its style.
+            val penModeTool = penShortcutState.underlying ?: toolConfig.activeTool
+            LaunchedEffect(penModeTool, penMode) { setPenModes(penModes.withTool(penMode, penModeTool)) }
+            /**
+             * The stylus's other end came into use: Rnote's `change_pen_mode`. The end put
+             * down keeps its pen, the one taken up brings its own out, and a button's
+             * temporary pen goes, as Rnote takes every override off.
+             */
+            penModeHandler = { mode ->
+                if (mode != penMode) {
+                    setPenModes(penModes.withTool(penMode, penShortcutState.underlying ?: toolConfig.activeTool))
+                    penMode = mode
+                    penShortcutState.picked()
+                    switchTool(penModes.tool(mode))
+                }
+            }
+            // Rnote's "Tool Locked" toast, one at a time, with its button to unlock the end in use.
+            val snackbarHostState = remember { SnackbarHostState() }
+            val snackbarScope = rememberCoroutineScope()
+            /** A pen picked in the pen picker: Rnote's `set_pen_style_with_lock`. */
+            val pickTool: (ToolType) -> Unit = { newTool ->
+                when (penModes.pick(penMode, newTool, toolConfig.activeTool)) {
+                    PenModes.Pick.SWITCH -> selectTool(newTool)
+                    PenModes.Pick.NOTHING -> Unit
+                    PenModes.Pick.LOCKED -> snackbarScope.launch {
+                        snackbarHostState.currentSnackbarData?.dismiss()
+                        val result = snackbarHostState.showSnackbar(
+                            "Tool Locked", actionLabel = "Unlock", duration = SnackbarDuration.Short
+                        )
+                        if (result == SnackbarResult.ActionPerformed) setPenModes(penModes.withLock(penMode, false))
+                    }
+                }
+            }
+            /** Rnote's "Stylus pen modes" rows: the end in use takes its new pen at once. */
+            val changePenModes: (PenModes) -> Unit = { modes ->
+                val before = penModes.tool(penMode)
+                setPenModes(modes)
+                if (modes.tool(penMode) != before) selectTool(modes.tool(penMode))
+            }
             /**
              * Whether a temporary pen from a button still has something on the go, as Rnote's
              * pen reports it has not finished: a selection held, a text box open.
@@ -2369,21 +2542,60 @@ class MainActivity : ComponentActivity() {
             }
             // Which of the colour picker's two pads the palette sets; Rnote's starts on the stroke.
             var fillPadActive by remember { mutableStateOf(false) }
+            // Rnote's camera bounds for the layout (see ViewportState.boundsFor). What is on a
+            // Continuous Vertical document is measured only when it is one, and only again
+            // when it changes, not as the view moves.
+            val continuousContentHeight by remember {
+                derivedStateOf {
+                    if (paperStyle.layoutMode != LayoutMode.CONTINUOUS_VERTICAL) {
+                        0f
+                    } else {
+                        ExportLayout.contentBounds(strokes, documentNativeElements)
+                            ?.let { maxOf(it.bottom, 0f) - minOf(it.top, 0f) } ?: 0f
+                    }
+                }
+            }
+            val viewBounds = ViewportState.boundsFor(
+                paperStyle.layoutMode,
+                if (paperStyle.pageSize.isInfinite) 0f else paperStyle.effectivePageWidthPx,
+                if (paperStyle.pageSize.isInfinite) 0f else paperStyle.effectivePageHeightPx,
+                paperStyle.fixedPages,
+                continuousContentHeight
+            )
+            /**
+             * The view moved by hand — dragged, pinched, zoomed — kept to the document as
+             * Rnote's camera keeps it (see ViewportState.clampedTo).
+             */
+            val moveView: (ViewportState) -> Unit = { moved ->
+                viewportState = moved.clampedTo(viewBounds, canvasSize.width.toFloat(), canvasSize.height.toFloat())
+            }
+            // And again when the view or the document changes size, as Rnote's canvas does.
+            LaunchedEffect(viewBounds, canvasSize) { moveView(viewportState) }
             /** Zoomed by [factor] about the middle of the view, as Rnote's zoom keys do. */
             val zoomBy: (Float) -> Unit = { factor ->
                 val middle = Offset(canvasSize.width / 2f, canvasSize.height / 2f)
-                viewportState = viewportState.zoomedAround(middle, viewportState.zoomScale * factor)
+                moveView(viewportState.zoomedAround(middle, viewportState.zoomScale * factor))
             }
             val zoomFitWidth: () -> Unit = {
-                viewportState = viewportState.fittedToWidth(
-                    canvasSize.width.toFloat(),
-                    canvasSize.height.toFloat(),
-                    if (paperStyle.pageSize.isInfinite) 0f else paperStyle.effectivePageWidthPx
+                moveView(
+                    viewportState.fittedToWidth(
+                        canvasSize.width.toFloat(),
+                        canvasSize.height.toFloat(),
+                        if (paperStyle.pageSize.isInfinite) 0f else paperStyle.effectivePageWidthPx
+                    )
+                )
+            }
+            val zoomRealSize: () -> Unit = {
+                moveView(
+                    viewportState.zoomedToRealSize(
+                        canvasSize.width.toFloat(), canvasSize.height.toFloat(), paperStyle.dpi
+                    )
                 )
             }
 
             BabyRnoteTheme(darkTheme = paperStyle.isDarkMode) {
                 Scaffold(
+                    snackbarHost = { SnackbarHost(snackbarHostState) },
                     topBar = {
                         Column {
                             RnoteTopBar(
@@ -2393,15 +2605,17 @@ class MainActivity : ComponentActivity() {
                                 isModified = isModified,
                                 documentTitle = documentTitle,
                                 currentPage = pageGridLabel,
-                                onResetZoom = { viewportState = ViewportState(displayScale = displayScale) },
+                                onResetZoom = { moveView(ViewportState(displayScale = displayScale)) },
                                 // Unlike the zoom reset next to it, this keeps the zoom and
                                 // only moves the view — see ViewportState.returnedToOrigin.
                                 onReturnToOrigin = {
-                                    viewportState = viewportState.returnedToOrigin(
-                                        viewportWidthPx = canvasSize.width.toFloat(),
-                                        // Nothing to centre on when the document has no pages.
-                                        pageWidthPx = if (paperStyle.pageSize.isInfinite) 0f
-                                                      else paperStyle.effectivePageWidthPx
+                                    moveView(
+                                        viewportState.returnedToOrigin(
+                                            viewportWidthPx = canvasSize.width.toFloat(),
+                                            // Nothing to centre on when the document has no pages.
+                                            pageWidthPx = if (paperStyle.pageSize.isInfinite) 0f
+                                                          else paperStyle.effectivePageWidthPx
+                                        )
                                     )
                                 },
                                 onTitleTap = {
@@ -2432,6 +2646,8 @@ class MainActivity : ComponentActivity() {
                                 hasSelection = selectedStrokes.isNotEmpty() || selectedNatives.isNotEmpty(),
                                 onShare = shareNote,
                                 onShowRecent = { showRecent = true },
+                                canRestoreVersion = currentDocumentUri != null && protectedFrom == null,
+                                onRestoreVersion = { showRestore = true },
                                 onShowPages = { showPages = true },
                                 onNewDocument = newDocument,
                                 onExport = { showExportSheet = true },
@@ -2450,6 +2666,7 @@ class MainActivity : ComponentActivity() {
                                 onZoomOut = { zoomBy(1f / (1f + ViewportState.ZOOM_STEP)) },
                                 onZoomIn = { zoomBy(1f + ViewportState.ZOOM_STEP) },
                                 onZoomFitWidth = zoomFitWidth,
+                                onZoomRealSize = zoomRealSize,
                                 isFixedSize = paperStyle.layoutMode == LayoutMode.FIXED_SIZE,
                                 canRemovePage = paperStyle.fixedPages > 1,
                                 onAddPage = addPage,
@@ -2475,6 +2692,13 @@ class MainActivity : ComponentActivity() {
                                     onSelect = { id -> switchTab(id) {} },
                                     onClose = closeTab,
                                     onNew = newDocument
+                                )
+                            }
+                            protectedFrom?.let { version ->
+                                ProtectedNoteBanner(
+                                    version = version,
+                                    darkTheme = paperStyle.isDarkMode,
+                                    onSaveCopy = saveDocumentAs
                                 )
                             }
                         }
@@ -2507,6 +2731,8 @@ class MainActivity : ComponentActivity() {
                     ) {
                         DrawingCanvas(
                             toolConfig = toolConfig,
+                            penMode = penMode,
+                            penModes = penModes,
                             onShortcutKey = onShortcutKey,
                             onPenGestureEnd = {
                                 penShortcutState.gestureEnded(shortcutPenBusy())?.let(switchTool)
@@ -2515,9 +2741,7 @@ class MainActivity : ComponentActivity() {
                             viewportState = viewportState,
                             strokes = strokes,
                             selectedStrokes = selectedStrokes,
-                            onViewportChanged = { newViewport ->
-                                viewportState = newViewport
-                            },
+                            onViewportChanged = moveView,
                             onAddStroke = { newStroke ->
                                 pushUndo()
                                 redoStack.clear()
@@ -2714,24 +2938,28 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
+                        // A color picked for the stroke or the fill, by a swatch or a key (1 to 9).
+                        val pickStrokeColor: (Color) -> Unit = { newColor ->
+                            toolConfig = if (toolConfig.activeTool == ToolType.BRUSH && toolConfig.brushStyle == BrushStyle.MARKER) {
+                                toolConfig.copy(highlighterColor = newColor)
+                            } else {
+                                toolConfig.copy(penColor = newColor)
+                            }
+                            recolorSelection(newColor, false)
+                        }
+                        val pickFillColor: (Color) -> Unit = { newColor ->
+                            toolConfig = toolConfig.copy(fillColor = newColor)
+                            recolorSelection(newColor, true)
+                        }
+
                         // Top-center: stroke and fill color + palette (matches Rnote's colorpicker.ui)
                         if (!focusMode) ColorPicker(
                             activeColor = toolConfig.currentActiveColor,
-                            onColorSelected = { newColor ->
-                                toolConfig = if (toolConfig.activeTool == ToolType.BRUSH && toolConfig.brushStyle == BrushStyle.MARKER) {
-                                    toolConfig.copy(highlighterColor = newColor)
-                                } else {
-                                    toolConfig.copy(penColor = newColor)
-                                }
-                                recolorSelection(newColor, false)
-                            },
+                            onColorSelected = pickStrokeColor,
                             fillColor = toolConfig.fillColor,
                             fillPadActive = fillPadActive,
                             onPadSelected = { fill -> fillPadActive = fill },
-                            onFillColorSelected = { newColor ->
-                                toolConfig = toolConfig.copy(fillColor = newColor)
-                                recolorSelection(newColor, true)
-                            },
+                            onFillColorSelected = pickFillColor,
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
                                 .padding(top = 18.dp)
@@ -2784,13 +3012,19 @@ class MainActivity : ComponentActivity() {
                             )
                             val inView = box[2] >= viewTopLeft.x && box[0] <= viewBottomRight.x &&
                                 box[3] >= viewTopLeft.y && box[1] <= viewBottomRight.y
-                            val dx: Float
-                            val dy: Float
+                            var dx: Float
+                            var dy: Float
                             if (inView || canvasSize.width == 0) {
                                 dx = PASTE_OFFSET; dy = PASTE_OFFSET
                             } else {
                                 dx = (viewTopLeft.x + viewBottomRight.x) / 2f - (box[0] + box[2]) / 2f
                                 dy = (viewTopLeft.y + viewBottomRight.y) / 2f - (box[1] + box[3]) / 2f
+                            }
+                            // Not before the document's origin, which only an infinite one goes
+                            // past, as Rnote places what it pastes.
+                            if (paperStyle.layoutMode != LayoutMode.INFINITE) {
+                                dx = maxOf(dx, -box[0])
+                                dy = maxOf(dy, -box[1])
                             }
                             pushUndo()
                             redoStack.clear()
@@ -2901,6 +3135,12 @@ class MainActivity : ComponentActivity() {
                                 Shortcut.ERASER -> selectTool(ToolType.ERASER)
                                 Shortcut.SELECTOR -> selectTool(ToolType.SELECTOR)
                                 Shortcut.TOOLS -> selectTool(ToolType.TOOLS)
+                                // As a swatch in the color bar is clicked: into the pad that is active.
+                                Shortcut.COLOR_1, Shortcut.COLOR_2, Shortcut.COLOR_3, Shortcut.COLOR_4, Shortcut.COLOR_5,
+                                Shortcut.COLOR_6, Shortcut.COLOR_7, Shortcut.COLOR_8, Shortcut.COLOR_9 -> {
+                                    val color = BrnaColors.PenPalette.getOrNull(shortcut.colorSlot ?: -1) ?: return@handler false
+                                    if (fillPadActive) pickFillColor(color) else pickStrokeColor(color)
+                                }
                             }
                             true
                         }
@@ -2966,7 +3206,7 @@ class MainActivity : ComponentActivity() {
                             toolConfig = toolConfig,
                             canUndo = undoStack.isNotEmpty(),
                             canRedo = redoStack.isNotEmpty(),
-                            onToolSelected = selectTool,
+                            onToolSelected = pickTool,
                             onUndo = { performUndoAction?.invoke() },
                             onRedo = { performRedoAction?.invoke() },
                             modifier = Modifier
@@ -2999,6 +3239,8 @@ class MainActivity : ComponentActivity() {
                                     penShortcuts = it
                                     SettingsManager.savePenShortcuts(this@MainActivity, it)
                                 },
+                                penModes = penModes,
+                                onPenModesChanged = changePenModes,
                                 onDismiss = { showPageSettings = false },
                                 dockedAsSidePanel = !isCompactWidth,
                                 modifier = Modifier.align(Alignment.CenterEnd)
@@ -3235,6 +3477,24 @@ class MainActivity : ComponentActivity() {
                             suggestedFamily = pendingFontSuggestedName,
                             onConfirm = { family -> importFont(family) },
                             onDismiss = { pendingFontUri = null }
+                    // ── Versions kept of the note's file ─────────────────────────
+                    if (showRestore) {
+                        val uri = currentDocumentUri
+                        var versions by remember { mutableStateOf<List<Backups.Version>?>(null) }
+                        LaunchedEffect(uri) {
+                            versions = if (uri == null) {
+                                emptyList()
+                            } else {
+                                withContext(Dispatchers.IO) { Backups.versions(this@MainActivity, uri) }
+                            }
+                        }
+                        RestoreVersionDialog(
+                            versions = versions,
+                            onRestore = { version ->
+                                showRestore = false
+                                restoreVersion(version)
+                            },
+                            onDismiss = { showRestore = false }
                         )
                     }
 
@@ -3421,6 +3681,7 @@ class MainActivity : ComponentActivity() {
         // is recreated with the same intent after the process was reclaimed.
         if (savedInstanceState == null) {
             if (intent?.action == Intent.ACTION_VIEW) handleViewIntent(intent) else offerRecovery()
+            sweepBackups()
         }
     }
 
@@ -3428,6 +3689,13 @@ class MainActivity : ComponentActivity() {
     private fun offerRecovery() {
         lifecycleScope.launch {
             pendingRecovery = withContext(Dispatchers.IO) { Recovery.readAll(this@MainActivity) }
+        }
+    }
+
+    /** Lets go of kept versions past their week (see [Backups]). */
+    private fun sweepBackups() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            writeLock.withLock { Backups.sweep(this@MainActivity) }
         }
     }
 
@@ -3469,6 +3737,26 @@ class MainActivity : ComponentActivity() {
 
         /** What Rnote's "Import" takes that this app can: PDFs and pictures. */
         val IMPORTABLE_TYPES = arrayOf("application/pdf", "image/png", "image/jpeg")
+    }
+
+    /**
+     * Rnote's pen modes: the stylus's tip or its eraser end, as it touches or hovers over
+     * anything — the page, and the pen picker, which Rnote watches for this too, so that a
+     * pen picked with the eraser end is that end's.
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        notePenMode(ev)
+        return super.dispatchTouchEvent(ev)
+    }
+
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        notePenMode(ev)
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
+    private fun notePenMode(ev: MotionEvent) {
+        if (ev.pointerCount == 0) return
+        StylusButtons.penModeOf(ev.getToolType(0))?.let { penModeHandler?.invoke(it) }
     }
 
     /**
