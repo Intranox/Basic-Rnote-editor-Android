@@ -85,13 +85,19 @@ slots are disabled, grayed-out placeholders for parity with desktop Rnote's layo
   two-finger long-press toggles the eraser and Ctrl+Space the Tools. A temporary pen
   lasts while its button is held, and a temporary selector or typewriter until its
   selection is let go or its text box left, as Rnote's does.
+- **Stylus pen modes**, Rnote 0.15's, in Settings: the tip and — on a stylus that has
+  one — the eraser end each keep a pen of their own, and each can be locked, so that
+  picking another pen in the pen picker leaves it as it is ("Tool Locked", with a
+  button to unlock it). Rnote's defaults: the tip free, the eraser end locked to the
+  eraser. The app starts with the pen the tip had last, as Rnote does.
 - **Pen sounds**, Rnote's own, switched on in the canvas menu as in Rnote: a pencil
   scratching while the brush draws, a squeak at each marker stroke, and a
   typewriter — with its bell for a new line — for the Typewriter.
 - **Paper**: six patterns (dots, grid, lines, isometric grid, isometric dots,
   blank), A2–A6 / Letter / Legal / custom / infinite page sizes, four layout
   modes (fixed size, continuous vertical, semi-infinite, infinite), custom
-  background and pattern colors, adjustable spacing and DPI,
+  background and pattern colors, adjustable spacing and DPI (kept in the `.rnote`,
+  as Rnote keeps it),
   portrait/landscape, dark mode. A Fixed Size document has as many pages as Rnote
   gives it: Add Page, Remove Page and Resize to Fit Content in the canvas menu, and
   pages for an imported PDF. The isometric patterns stand on an upright edge,
@@ -116,8 +122,12 @@ slots are disabled, grayed-out placeholders for parity with desktop Rnote's layo
   Borders When Pasting", an inserted image stays clear of the next page border. Autosave, crash recovery, a warning before overwriting a file
   that changed elsewhere (save a copy, overwrite, or load the other version) —
   judged by the file's content, so a sync that only touches its time is no
-  alarm — a list of recent notes, and a page overview with thumbnails. Undo
-  reaches back 100 steps, as in Rnote.
+  alarm — a list of recent notes, and a page overview with thumbnails. Before a
+  save writes over a version of a file this app didn't write — as it was opened,
+  or as the laptop saved it since — that version is kept in the app's own
+  storage, the last 5 of each file for a week; "Restore Previous Version…" in the
+  menu brings one back as an unsaved note, and keeps what the file holds then as
+  well. Undo reaches back 100 steps, as in Rnote.
 - **Tabs**: several notes open at once, as in Rnote, each with its own undo
   history and view. Opening a note gives it a tab (or shows its tab if it is
   open already); a tab being left is saved first, and one that can't be is kept
@@ -147,16 +157,23 @@ slots are disabled, grayed-out placeholders for parity with desktop Rnote's layo
   every page, background and pattern included, to Android's print dialog. Copying
   a selection also puts a picture of it on Android's clipboard, as Rnote puts one on
   the desktop's, to paste into a document or a message.
-- **View**: Rnote's canvas menu — zoom out, reset and in, Zoom to Page Width — its
+- **View**: Rnote's canvas menu — zoom out, reset and in, Zoom to Page Width, and
+  Rnote 0.15's Zoom to Real Size, which shows the page as large as it is printed — its
   Focus Mode, which puts the pen picker, the colors and the pen settings away, and
-  Fullscreen, which hides Android's bars.
+  Fullscreen, which hides Android's bars. The view goes as far as Rnote's camera lets
+  it: an inch past the pages of a Fixed Size document, past a Continuous Vertical
+  one's width and a page below what is on it, past a Semi Infinite one's top and left
+  edge only, and anywhere on an Infinite one — so nothing is written where Rnote can't
+  scroll to. What is pasted or imported without being dropped somewhere lands where
+  Rnote puts it: in the view, never before the document's origin.
 - **Keyboard shortcuts** for a hardware keyboard, Rnote's own: Ctrl+Z / Ctrl+Shift+Z
   (and Ctrl+Y), Ctrl+S / Ctrl+Shift+S, Ctrl+O, Ctrl+N, Ctrl+P, Ctrl+Shift+I,
   Ctrl+L, Ctrl+Shift+O, Ctrl+Shift+P, Ctrl+Shift+A / Ctrl+Shift+R for pages, F11,
   Ctrl+C / X / V / A / D, Delete and Escape for the selection, Ctrl++ / Ctrl+- /
-  Ctrl+0 to zoom, Ctrl+1 to Ctrl+6 for the pens.
-  They follow the keyboard's layout, so Ctrl+Z is the Z key on a German
-  keyboard too.
+  Ctrl+0 to zoom, Ctrl+1 to Ctrl+6 for the pens, and Rnote 0.15's 1 to 9 (or Ctrl
+  and the number pad's 7 to 9) for the color picker's swatches, into the stroke or
+  the fill, whichever is active. They follow the keyboard's layout, so Ctrl+Z is the
+  Z key on a German keyboard too.
 
 **Not built**: layers (the stroke list is flat).
 
