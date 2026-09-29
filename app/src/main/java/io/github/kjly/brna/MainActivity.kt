@@ -131,10 +131,12 @@ import io.github.kjly.brna.model.SnapPositions
 import io.github.kjly.brna.render.NativeElementRenderer
 import io.github.kjly.brna.storage.Backups
 import io.github.kjly.brna.storage.ContentHash
+import io.github.kjly.brna.storage.CustomFonts
 import io.github.kjly.brna.storage.DocumentUri
 import io.github.kjly.brna.storage.FileManager
 import io.github.kjly.brna.storage.FolderBrowser
 import io.github.kjly.brna.storage.FolderListing
+import io.github.kjly.brna.storage.FontNameReader
 import io.github.kjly.brna.storage.ImageImport
 import io.github.kjly.brna.storage.NativeEditing
 import io.github.kjly.brna.storage.PdfImporter
@@ -161,6 +163,8 @@ import io.github.kjly.brna.ui.canvas.SelectionManager
 import io.github.kjly.brna.ui.canvas.StylusButtons
 import io.github.kjly.brna.ui.components.ColorPicker
 import io.github.kjly.brna.ui.components.ExportSheet
+import io.github.kjly.brna.ui.components.FontManagerDialog
+import io.github.kjly.brna.ui.components.NameFontDialog
 import io.github.kjly.brna.ui.components.PageSettingsSheet
 import io.github.kjly.brna.storage.PdfImportPrefs
 import io.github.kjly.brna.storage.PdfPageLayout
@@ -706,6 +710,92 @@ class MainActivity : ComponentActivity() {
                 onImageInserted?.invoke(image)
             }
         }
+    }
+
+    // ── Custom fonts: font files loaded from the device, standing in for a family
+    // Android's own faces don't cover — see storage.CustomFonts. ──────────────────
+    /** Registered fonts, refreshed after every import or removal. */
+    private var customFonts by mutableStateOf<List<CustomFonts.Entry>>(emptyList())
+    /** Bumped after a font is added or removed, so the canvas drops its stale text layouts. */
+    private var customFontsVersion by mutableIntStateOf(0)
+    private var showFontManager by mutableStateOf(false)
+    /** A font file just picked, waiting for the family name to register it under. */
+    private var pendingFontUri by mutableStateOf<Uri?>(null)
+    private var pendingFontSuggestedName by mutableStateOf("")
+
+    private val pickFontLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let {
+            // The file is read off the main thread: a font can be megabytes, and a provider
+            // like Drive may have to fetch it first.
+            lifecycleScope.launch {
+                val (family, fileTitle) = withContext(Dispatchers.IO) {
+                    detectFontFamily(it) to
+                        DocumentUri.titleFrom(DocumentUri.displayName(this@MainActivity, it) ?: it.lastPathSegment ?: "Font")
+                }
+                // Read the family straight out of the font file's own name table when we
+                // can; a name typed by hand only if that fails (an unsupported container,
+                // or a file that isn't really a font).
+                pendingFontSuggestedName = family ?: fileTitle
+                pendingFontUri = it
+            }
+        }
+    }
+
+    /**
+     * The family name embedded in [uri]'s own font data, or null if it can't be read —
+     * the file is larger than fonts reasonably get, isn't a font at all, or is a
+     * container FontNameReader doesn't understand. Reads the whole file into memory,
+     * which is fine for a font (typically well under a megabyte, rarely more than a
+     * few); the cap below is just a guard against reading something enormous by mistake.
+     */
+    private fun detectFontFamily(uri: Uri): String? {
+        val cap = 20 * 1024 * 1024
+        val bytes = try {
+            contentResolver.openInputStream(uri)?.use { input ->
+                val buffer = java.io.ByteArrayOutputStream()
+                val chunk = ByteArray(64 * 1024)
+                var total = 0
+                while (true) {
+                    val read = input.read(chunk)
+                    if (read < 0) break
+                    total += read
+                    if (total > cap) return null
+                    buffer.write(chunk, 0, read)
+                }
+                buffer.toByteArray()
+            }
+        } catch (e: Exception) {
+            null
+        } ?: return null
+        return FontNameReader.familyName(bytes)
+    }
+
+    /** Registers the font just picked under [family], and refreshes what draws it. */
+    private fun importFont(family: String) {
+        val uri = pendingFontUri ?: return
+        pendingFontUri = null
+        lifecycleScope.launch {
+            // Copied and loaded off the main thread, like reading the name was.
+            val loaded = withContext(Dispatchers.IO) {
+                val originalName = DocumentUri.displayName(this@MainActivity, uri) ?: pendingFontSuggestedName
+                CustomFonts.import(this@MainActivity, uri, family, originalName)
+                    ?.let { CustomFonts.load(this@MainActivity) }
+            }
+            if (loaded == null) {
+                Toast.makeText(this@MainActivity, "Could not load that as a font", Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            customFonts = loaded
+            customFontsVersion++
+        }
+    }
+
+    private fun removeFont(entry: CustomFonts.Entry) {
+        CustomFonts.remove(this, entry)
+        customFonts = CustomFonts.load(this)
+        customFontsVersion++
     }
 
     private val openDocumentLauncher = registerForActivityResult(
@@ -1435,6 +1525,10 @@ class MainActivity : ComponentActivity() {
         tabOrder.add(activeTab)
         workspaces = Workspaces.load(this)
         selectedWorkspace = Workspaces.loadSelected(this)
+        // Fonts loaded in an earlier session: into memory now, so the first frame
+        // already draws with them rather than falling back until this has run.
+        CustomFonts.restore(this)
+        customFonts = CustomFonts.load(this)
         // While the app is in front: look now and then whether Toni saved the open note.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -2609,7 +2703,8 @@ class MainActivity : ComponentActivity() {
                                 focusMode = focusMode,
                                 onToggleFocusMode = { focusMode = !focusMode },
                                 fullscreen = fullscreen,
-                                onToggleFullscreen = { fullscreen = !fullscreen }
+                                onToggleFullscreen = { fullscreen = !fullscreen },
+                                onManageFonts = { showFontManager = true }
                             )
                             // Desktop Rnote's tab bar: there once more than one note is open.
                             if (tabOrder.size > 1) {
@@ -2776,6 +2871,7 @@ class MainActivity : ComponentActivity() {
                                 }
                                 isModified = true
                             },
+                            customFontsVersion = customFontsVersion,
                         )
 
                         // The Typewriter's text field, over the box being typed into.
@@ -3371,6 +3467,45 @@ class MainActivity : ComponentActivity() {
                                 openRecent(Uri.parse(entry.uri))
                             },
                             onDismiss = { showRecent = false }
+                        )
+                    }
+
+                    // ── Fonts: files loaded to stand in for a family Android doesn't have ──
+                    if (showFontManager) {
+                        // Families this note's text boxes ask for that nothing loaded covers —
+                        // a hint, computed from the runs the same way NativeElementRenderer
+                        // resolves them, not from fontFamily alone (a ranged attribute can
+                        // switch family mid-box).
+                        val missingFamilies = remember(documentNativeElements, customFonts) {
+                            documentNativeElements
+                                .filterIsInstance<NativeTextElement>()
+                                .flatMap { el -> TextFormatting.runs(el).map { it.family } }
+                                .distinct()
+                                .filter { family ->
+                                    CustomFonts.get(family) == null &&
+                                        family.lowercase() !in setOf("serif", "sans-serif", "sans_serif", "monospace", "mono", "cursive")
+                                }
+                        }
+                        FontManagerDialog(
+                            fonts = customFonts,
+                            missingFamilies = missingFamilies,
+                            onPickFile = {
+                                pickFontLauncher.launch(
+                                    arrayOf(
+                                        "font/ttf", "font/otf", "font/collection",
+                                        "application/x-font-ttf", "application/x-font-otf", "application/octet-stream"
+                                    )
+                                )
+                            },
+                            onRemove = { removeFont(it) },
+                            onDismiss = { showFontManager = false }
+                        )
+                    }
+                    pendingFontUri?.let {
+                        NameFontDialog(
+                            suggestedFamily = pendingFontSuggestedName,
+                            onConfirm = { family -> importFont(family) },
+                            onDismiss = { pendingFontUri = null }
                         )
                     }
 
